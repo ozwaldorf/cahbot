@@ -1,11 +1,11 @@
 package main
 
 import (
-	"encoding/json"
+	"bufio"
 	"fmt"
 	"github.com/whyrusleeping/hellabot"
 	"math/rand"
-	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -14,26 +14,19 @@ import (
 //AWH3Q
 
 type (
-	Card struct {
-		ID        string   `json:"id"`
-		CreatedAt string   `json:"created_at"`
-		NSFW      string   `json:"nsfw"`
-		Text      []string `json:"text"`
-	}
-
 	Player struct {
 		Nick       string
-		Cards      []Card
-		Choose     chan Card
-		Choices    []Card
-		CzarChoice chan ChoicePool
+		Hand       []string
+		Choice     chan []string
+		HasChosen  bool
+		CzarChoice chan int
 
 		Points     int
 		Save, Czar bool // if true then save hand for next round
 	}
 
 	ChoicePool struct {
-		Cards []Card
+		Cards []string
 		Nick  string
 	}
 )
@@ -41,13 +34,19 @@ type (
 var (
 	Players       = make(map[string]*Player)
 	RoundPlayers  = make(map[string]*Player)
+	GameMsg       *hbot.Message
+	CardCzar      *Player
+	RespNum       int
 	PlayerNicks   []string
 	CzarChoices   []ChoicePool
-	Calls         []Card
-	Responses     []Card
+	CanCzarChoose bool
+	Calls         []string
+	Responses     []string
 	UsedResponses []string
 	UsedCalls     []string
 	InGame        bool
+	RPos          = 0
+	CPos          = 0
 )
 
 var Triggers = []hbot.Trigger{
@@ -56,36 +55,13 @@ var Triggers = []hbot.Trigger{
 			return strings.Split(m.Content, " ")[0] == ".help"
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
-			irc.Reply(m, ".adddeck [code] : add deck to card pool")
-			irc.Reply(m, ".players : list players currently in game")
-			irc.Reply(m, ".join : join the game")
-			irc.Reply(m, ".leave : leave the game")
-			irc.Reply(m, ".choose [number] : pick a card")
-			irc.Reply(m, ".start : start the game")
-			irc.Reply(m, ".score : display the score for all users")
-			return false
-		},
-	},
-
-	hbot.Trigger{
-		func(bot *hbot.Bot, m *hbot.Message) bool {
-			return strings.Split(m.Content, " ")[0] == ".adddeck"
-		},
-		func(irc *hbot.Bot, m *hbot.Message) bool {
-			opts := strings.Split(m.Content, " ")
-			if len(opts) == 2 {
-				calls := getCalls(opts[1])
-				responses := getResponses(opts[1])
-				if len(calls) == 0 || len(responses) == 0 {
-					irc.Reply(m, "failed to add deck "+opts[1])
-					return false
-				}
-				Calls = append(Calls, calls...)
-				Responses = append(Responses, responses...)
-				irc.Reply(m, "Added deck "+opts[1])
-			} else {
-				irc.Reply(m, "Please specify a CardCast deck code")
-			}
+			irc.Reply(m, "\x02\x0304.join\x0F : join the game")
+			irc.Reply(m, "\x02\x0304.leave\x0F : leave the game")
+			irc.Reply(m, "\x02\x0304.start \x0302[maxscore]\x0F : start the game")
+			irc.Reply(m, "\x02\x0304.stop\x0F : stop the game")
+			irc.Reply(m, "\x02\x0304.score\x0F : display the score for all users")
+			irc.Reply(m, "\x02\x0304.choose \x0302[number]\x0F : pick a card")
+			irc.Reply(m, "\x02\x0304.players\x0F : list players currently in game")
 			return false
 		},
 	},
@@ -95,11 +71,7 @@ var Triggers = []hbot.Trigger{
 			return strings.Split(m.Content, " ")[0] == ".randcall"
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
-			if len(Calls) != 0 {
-				irc.Reply(m, strings.Join(Calls[rand.Int()%len(Calls)].Text, "___"))
-			} else {
-				irc.Reply(m, "Please add a deck with .adddeck [code]")
-			}
+			irc.Reply(m, Calls[rand.Int()%len(Calls)])
 			return false
 		},
 	},
@@ -109,11 +81,7 @@ var Triggers = []hbot.Trigger{
 			return strings.Split(m.Content, " ")[0] == ".randresponse"
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
-			if len(Responses) != 0 {
-				irc.Reply(m, Responses[rand.Int()%len(Responses)].Text[0])
-			} else {
-				irc.Reply(m, "Please add a deck with .adddeck [code]")
-			}
+			irc.Reply(m, Responses[rand.Int()%len(Responses)])
 			return false
 		},
 	},
@@ -134,7 +102,7 @@ var Triggers = []hbot.Trigger{
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
 			for k, v := range Players {
-				irc.Reply(m, fmt.Sprintf("%s: %d", k, v.Points))
+				irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F: \x02\x0302%d\x0F", k, v.Points))
 			}
 			return false
 		},
@@ -147,11 +115,12 @@ var Triggers = []hbot.Trigger{
 		func(irc *hbot.Bot, m *hbot.Message) bool {
 			Players[m.From] = &Player{
 				Nick:       m.From,
-				Choose:     make(chan Card),
-				CzarChoice: make(chan ChoicePool),
+				Choice:     make(chan []string),
+				CzarChoice: make(chan int),
+				Points:     0,
 			}
 			PlayerNicks = append(PlayerNicks, m.From)
-			irc.Reply(m, m.From+" has joined the game")
+			irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has joined the game", m.From))
 			return false
 		},
 	},
@@ -169,7 +138,7 @@ var Triggers = []hbot.Trigger{
 						break
 					}
 				}
-				irc.Reply(m, m.From+" has left the game")
+				irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has left the game", m.From))
 			}
 			return false
 		},
@@ -180,24 +149,39 @@ var Triggers = []hbot.Trigger{
 			return strings.Split(m.Content, " ")[0] == ".choose"
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
-			opts := strings.Split(m.Content, " ")
-			if len(opts) == 2 {
-				if _, ok := RoundPlayers[m.From]; ok {
-					n, e := strconv.Atoi(opts[1])
-					if Players[m.From].Czar {
-						if e == nil && n >= 0 && n < len(PlayerNicks) {
-							Players[m.From].CzarChoice <- CzarChoices[n]
-							//						Players[m.From].Choices = append(Players[m.From].Choices, Players[m.From].Cho)
+			opts := strings.Fields(m.Content)
+			if len(opts) > 1 {
+				if _, ok := Players[m.From]; ok {
+					if CardCzar.Nick == m.From && CanCzarChoose {
+						i, err := strconv.Atoi(opts[1])
+						if err != nil || i > RespNum {
+							irc.Reply(m, "Invalid Number")
+							return false
 						}
-					} else {
-						if e == nil && n >= 0 && n <= 5 {
-							Players[m.From].Choices = append(Players[m.From].Choices, Players[m.From].Cards[n])
-							Players[m.From].Choose <- Players[m.From].Cards[n]
-						} else {
-							irc.Notice(m.From, "Please enter a valid option")
+						i++
+						irc.Reply(GameMsg, m.From+" has chosen their card")
+						CardCzar.CzarChoice <- i
+					} else if !RoundPlayers[m.From].HasChosen {
+						// TODO choose a card
+						var slice []string
+						for k := range opts[1:] {
+							i, err := strconv.Atoi(opts[k+1])
+							if err != nil || i > 5 {
+								irc.Msg(m.From, "Invalid Number")
+								return false
+							}
+							slice = append(slice, RoundPlayers[m.From].Hand[i])
+
+							Players[m.From].Hand = append(Players[m.From].Hand[:i], Players[m.From].Hand[i+1:]...)
+							//add new cards to hand
+							Players[m.From].Hand = append(Players[m.From].Hand, Responses[RPos])
+							RPos++
+							//delete(Players[m.From].Hand, i)
 						}
+						RoundPlayers[m.From].Choice <- slice
 					}
 				}
+
 			}
 			return false
 		},
@@ -207,7 +191,22 @@ var Triggers = []hbot.Trigger{
 		func(bot *hbot.Bot, m *hbot.Message) bool {
 			return strings.Split(m.Content, " ")[0] == ".start"
 		},
-		start,
+		func(bot *hbot.Bot, m *hbot.Message) bool {
+			opts := strings.Fields(m.Content)
+			if len(opts) == 2 {
+				if len(Players) > 1 {
+					i, err := strconv.Atoi(opts[1])
+					if err != nil {
+						bot.Reply(m, "Invalid Number")
+						return false
+					}
+					start(bot, m, i)
+				}
+			} else {
+				bot.Reply(m, "missing maxscore")
+			}
+			return false
+		},
 	},
 	hbot.Trigger{
 		func(bot *hbot.Bot, m *hbot.Message) bool {
@@ -215,94 +214,108 @@ var Triggers = []hbot.Trigger{
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
 			InGame = false
+			RoundPlayers = make(map[string]*Player)
+			Players = make(map[string]*Player)
+
+			irc.Reply(m, fmt.Sprintf("game ended"))
 			return false
 		},
 	},
 }
 
-func start(irc *hbot.Bot, m *hbot.Message) bool {
+func waitForCards(p map[string]*Player) []ChoicePool {
+	var t []ChoicePool
+	i := 0
+	for k := range p {
+		t = append(t, ChoicePool{Cards: <-p[k].Choice, Nick: k})
+		i++
+	}
+	return t
+}
+
+func start(irc *hbot.Bot, m *hbot.Message, max int) bool {
 	if !InGame {
+		GameMsg = m
 		InGame = true
+		Calls = Shuffle(Calls)
+		Responses = Shuffle(Responses)
+		for k := range Players {
+			Players[k].Hand = Responses[RPos*5 : 5+RPos*5]
+			RPos = RPos + 5
+		}
 		for InGame { // game loop
-			czar := PlayerNicks[rand.Int()%len(PlayerNicks)]
-			RoundPlayers = Players
-			RoundPlayers[czar].Czar = true
-			irc.Reply(m, czar+" is the czar this round")
-
-			/* random cards */
-			Calls = Shuffle(Calls)
-			irc.Reply(m, "This rounds black card is: "+strings.Join(Calls[0].Text, "___"))
-			Responses = Shuffle(Responses)
-			n := 0
-			for k := range RoundPlayers {
-				RoundPlayers[k].Cards = Responses[n*5 : 5+n*5]
-				n++
-			}
-
-			for i := 0; i < len(Calls[0].Text)-1; i++ {
-				for k := range RoundPlayers {
-					if !RoundPlayers[k].Czar {
-						var cardpool []string
-						i := 0
-						for _, v := range RoundPlayers[k].Cards {
-							cardpool = append(cardpool, fmt.Sprintf("%d. %s", i, v.Text[0]))
-							i++
-						}
-						irc.Notice(k, "Please choose a(nother) card with .choose [number]")
-						irc.Notice(k, strings.Join(cardpool, " | "))
+			for k := range Players {
+				if Players[k].Points == max {
+					irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has won the game!", Players[k].Nick))
+					for k, v := range Players {
+						irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F: \x02\x0302%d\x0F", k, v.Points))
 					}
-				}
-				for k := range RoundPlayers {
-					if !RoundPlayers[k].Czar {
-						<-RoundPlayers[k].Choose
-					}
+
+					InGame = false
+					RoundPlayers = make(map[string]*Player)
+					Players = make(map[string]*Player)
+					return false
 				}
 			}
-			// wait for all players to choose a card
+			c := rand.Intn(len(PlayerNicks))
+			CardCzar = Players[PlayerNicks[c]]
+			CardCzar.Czar = true
 
-			irc.Notice(czar, "Please choose a response with .choose [nunmber] for: "+strings.Join(Calls[0].Text, "___"))
-			i := 0
+			for k, v := range Players {
+				if !Players[k].Czar {
+					RoundPlayers[k] = v
+				}
+			}
+			irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F is the Card Czar this round!", CardCzar.Nick))
+
+			irc.Reply(m, "\x02\x0300,01 Black Card \x0F : "+Calls[CPos])
+			RespNum = strings.Count(Calls[CPos], "_")
+			if RespNum == 0 {
+				RespNum++
+			}
 			for k := range RoundPlayers {
-				if !RoundPlayers[k].Czar {
-					var cardpool []string
-					for i := 0; i < len(Calls[0].Text)-1; i++ {
-						cardpool = append(cardpool, RoundPlayers[k].Choices[i].Text[0])
-					}
-					CzarChoices = append(CzarChoices, ChoicePool{
-						Cards: RoundPlayers[k].Choices,
-						Nick:  RoundPlayers[k].Nick,
-					})
-					irc.Notice("#cah", fmt.Sprintf("%d. %s", i, strings.Join(cardpool, " | ")))
+				irc.Msg(RoundPlayers[k].Nick, "\x02\x0300,01 Black Card \x0F : "+Calls[CPos])
+				irc.Msg(RoundPlayers[k].Nick, fmt.Sprintf("Please choose (\x02%d\x0F) \x02\x0301,00 White Card(s) \x0F with \x02\x0304.choose \x0302[int] [int]\x0399 ...\x0F", RespNum))
+				i := 0
+				for x := range RoundPlayers[k].Hand {
+					irc.Msg(RoundPlayers[k].Nick, fmt.Sprintf("[\x02\x0302%d\x0F] %s", i, RoundPlayers[k].Hand[x]))
 					i++
 				}
 			}
 
-			WinningCard := <-RoundPlayers[czar].CzarChoice
-			var cardpool []string
-			for i := 0; i < len(Calls[0].Text)-1; i++ {
-				cardpool = append(cardpool, WinningCard.Cards[i].Text[0])
+			czarChoices := waitForCards(RoundPlayers) // map[string][]string
+			irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F, please choose the winning \x02\x0301,00 White Card \x0F combination", CardCzar.Nick))
+			i := 0
+			for k := range czarChoices {
+				irc.Reply(m, fmt.Sprintf("[\x02\x0302%d\x0F] %s", i, strings.Join(czarChoices[k].Cards, " | ")))
+				i++
 			}
+			CanCzarChoose = true
 
-			irc.Reply(m, WinningCard.Nick+" has won the round with: "+strings.Join(cardpool, "|"))
-			RoundPlayers[WinningCard.Nick].Points++
+			r := <-CardCzar.CzarChoice
+			WinningCard := czarChoices[r-1]
 
-			/* reset player choices */
+			irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has won the round with: %v", WinningCard.Nick, WinningCard.Cards))
+			Players[WinningCard.Nick].Points++
+
 			for k := range RoundPlayers {
-				RoundPlayers[k].Choices = []Card{}
+				RoundPlayers[k].HasChosen = false
 			}
-			CzarChoices = []ChoicePool{}
-			RoundPlayers[czar].Czar = false
+			CardCzar.Czar = false
+			CanCzarChoose = false
+			RoundPlayers = make(map[string]*Player)
+			CPos++
 		}
 		UsedResponses = []string{}
 	} else {
-		irc.Reply(m, "Game already in progress!")
+		irc.Reply(m, "\x0304Game already in progress!")
 	}
 	return false
 }
 
-func Shuffle(vals []Card) []Card {
+func Shuffle(vals []string) []string {
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	ret := make([]Card, len(vals))
+	ret := make([]string, len(vals))
 	n := len(vals)
 	for i := 0; i < n; i++ {
 		randIndex := r.Intn(len(vals))
@@ -312,31 +325,35 @@ func Shuffle(vals []Card) []Card {
 	return ret
 }
 
-func getCalls(id string) (calls []Card) {
-	resp, e := http.Get("https://api.cardcastgame.com/v1/decks/" + id + "/calls")
-	if e != nil {
-		return
+func readLines(path string) ([]string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	dec := json.NewDecoder(resp.Body)
-	dec.Decode(&calls)
-	return
-}
+	defer file.Close()
 
-func getResponses(id string) (responses []Card) {
-	resp, e := http.Get("https://api.cardcastgame.com/v1/decks/" + id + "/responses")
-	if e != nil {
-		return
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
 	}
-	dec := json.NewDecoder(resp.Body)
-	dec.Decode(&responses)
-	return
+	return lines, scanner.Err()
 }
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+	var err error
+	Calls, err = readLines("black.txt")
+	if err != nil {
+		panic(err)
+	}
+	Responses, err = readLines("white.txt")
+	if err != nil {
+		panic(err)
+	}
 
 	channels := func(bot *hbot.Bot) {
-		bot.Channels = []string{"#cah"}
+		bot.Channels = []string{"#rekt"}
 	}
 	irc, err := hbot.NewBot("irc.rekt.network:6667", "cahbot", func(bot *hbot.Bot) {}, channels)
 	if err != nil {
@@ -348,8 +365,5 @@ func main() {
 	}
 
 	irc.Run()
-
-	fmt.Printf("%v\n", getCalls("AWH3Q")[0])
-	fmt.Printf("%v\n", getResponses("AWH3Q")[0])
 
 }
