@@ -37,6 +37,7 @@ var (
 	GameMsg       *hbot.Message
 	CardCzar      *Player
 	RespNum       int
+	MaxScore      = 10
 	PlayerNicks   []string
 	CzarChoices   []ChoicePool
 	CanCzarChoose bool
@@ -57,9 +58,10 @@ var Triggers = []hbot.Trigger{
 		func(irc *hbot.Bot, m *hbot.Message) bool {
 			irc.Reply(m, "\x02\x0304.join\x0F : join the game")
 			irc.Reply(m, "\x02\x0304.leave\x0F : leave the game")
-			irc.Reply(m, "\x02\x0304.start \x0302[maxscore]\x0F : start the game")
+			irc.Reply(m, "\x02\x0304.start : start the game")
 			irc.Reply(m, "\x02\x0304.stop\x0F : stop the game")
 			irc.Reply(m, "\x02\x0304.score\x0F : display the score for all users")
+			irc.Reply(m, "\x02\x0304.maxscore\x0F \x0302[number]\x0F : maximum score of the game (default 10)")
 			irc.Reply(m, "\x02\x0304.choose \x0302[number]\x0F : pick a card")
 			irc.Reply(m, "\x02\x0304.players\x0F : list players currently in game")
 			return false
@@ -102,6 +104,7 @@ var Triggers = []hbot.Trigger{
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
 			for k, v := range Players {
+				irc.Reply(m, fmt.Sprintf("\x02\x0304Winning Score\x0F: \x02\x0302%d\x0F", MaxScore))
 				irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F: \x02\x0302%d\x0F", k, v.Points))
 			}
 			return false
@@ -113,14 +116,18 @@ var Triggers = []hbot.Trigger{
 			return strings.Split(m.Content, " ")[0] == ".join"
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
-			Players[m.From] = &Player{
-				Nick:       m.From,
-				Choice:     make(chan []string),
-				CzarChoice: make(chan int),
-				Points:     0,
+			if _, ok := Players[m.From]; !ok {
+				Players[m.From] = &Player{
+					Nick:       m.From,
+					Choice:     make(chan []string),
+					CzarChoice: make(chan int),
+					Points:     0,
+				}
+				PlayerNicks = append(PlayerNicks, m.From)
+				irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has joined the game", m.From))
+			} else {
+				irc.Reply(m, "You are already in the game")
 			}
-			PlayerNicks = append(PlayerNicks, m.From)
-			irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has joined the game", m.From))
 			return false
 		},
 	},
@@ -139,6 +146,8 @@ var Triggers = []hbot.Trigger{
 					}
 				}
 				irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has left the game", m.From))
+			} else {
+				irc.Reply(m, "You are not in the game")
 			}
 			return false
 		},
@@ -150,9 +159,9 @@ var Triggers = []hbot.Trigger{
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
 			opts := strings.Fields(m.Content)
-			if len(opts) > 1 {
+			if len(opts) > 1 && InGame {
 				if _, ok := Players[m.From]; ok {
-					if CardCzar.Nick == m.From && CanCzarChoose {
+					if CardCzar.Nick == m.From && CanCzarChoose == true {
 						i, err := strconv.Atoi(opts[1])
 						if err != nil || i > RespNum {
 							irc.Reply(m, "Invalid Number")
@@ -172,16 +181,21 @@ var Triggers = []hbot.Trigger{
 							}
 							slice = append(slice, RoundPlayers[m.From].Hand[i])
 
+							// handle new cards
 							Players[m.From].Hand = append(Players[m.From].Hand[:i], Players[m.From].Hand[i+1:]...)
-							//add new cards to hand
 							Players[m.From].Hand = append(Players[m.From].Hand, Responses[RPos])
 							RPos++
-							//delete(Players[m.From].Hand, i)
+							irc.Reply(GameMsg, m.From+" has chosen their card")
 						}
 						RoundPlayers[m.From].Choice <- slice
+					} else {
+						irc.Reply(m, "You cannot choose right now")
 					}
+				} else {
+					irc.Reply(m, "Join the game with .join")
 				}
-
+			} else {
+				irc.Reply(m, "Game not started")
 			}
 			return false
 		},
@@ -192,6 +206,21 @@ var Triggers = []hbot.Trigger{
 			return strings.Split(m.Content, " ")[0] == ".start"
 		},
 		func(bot *hbot.Bot, m *hbot.Message) bool {
+			if !InGame {
+				if len(Players) > 1 {
+					start(bot, m)
+				}
+			} else {
+				bot.Reply(m, "Game already in progress")
+			}
+			return false
+		},
+	},
+	hbot.Trigger{
+		func(bot *hbot.Bot, m *hbot.Message) bool {
+			return strings.Split(m.Content, " ")[0] == ".maxscore"
+		},
+		func(bot *hbot.Bot, m *hbot.Message) bool {
 			opts := strings.Fields(m.Content)
 			if len(opts) == 2 {
 				if len(Players) > 1 {
@@ -200,10 +229,10 @@ var Triggers = []hbot.Trigger{
 						bot.Reply(m, "Invalid Number")
 						return false
 					}
-					start(bot, m, i)
+					MaxScore = i
 				}
 			} else {
-				bot.Reply(m, "missing maxscore")
+				bot.Reply(m, "Usage: .maxscore [number]")
 			}
 			return false
 		},
@@ -213,11 +242,15 @@ var Triggers = []hbot.Trigger{
 			return strings.Split(m.Content, " ")[0] == ".stop"
 		},
 		func(irc *hbot.Bot, m *hbot.Message) bool {
-			InGame = false
-			RoundPlayers = make(map[string]*Player)
-			Players = make(map[string]*Player)
+			if InGame {
+				InGame = false
+				RoundPlayers = make(map[string]*Player)
+				Players = make(map[string]*Player)
 
-			irc.Reply(m, fmt.Sprintf("game ended"))
+				irc.Reply(m, fmt.Sprintf("game ended"))
+			} else {
+				irc.Reply(m, "Game not running")
+			}
 			return false
 		},
 	},
@@ -233,7 +266,7 @@ func waitForCards(p map[string]*Player) []ChoicePool {
 	return t
 }
 
-func start(irc *hbot.Bot, m *hbot.Message, max int) bool {
+func start(irc *hbot.Bot, m *hbot.Message) bool {
 	if !InGame {
 		GameMsg = m
 		InGame = true
@@ -245,7 +278,7 @@ func start(irc *hbot.Bot, m *hbot.Message, max int) bool {
 		}
 		for InGame { // game loop
 			for k := range Players {
-				if Players[k].Points == max {
+				if Players[k].Points == MaxScore {
 					irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F has won the game!", Players[k].Nick))
 					for k, v := range Players {
 						irc.Reply(m, fmt.Sprintf("\x02\x0304%s\x0F: \x02\x0302%d\x0F", k, v.Points))
@@ -260,6 +293,7 @@ func start(irc *hbot.Bot, m *hbot.Message, max int) bool {
 			c := rand.Intn(len(PlayerNicks))
 			CardCzar = Players[PlayerNicks[c]]
 			CardCzar.Czar = true
+			CanCzarChoose = false
 
 			for k, v := range Players {
 				if !Players[k].Czar {
